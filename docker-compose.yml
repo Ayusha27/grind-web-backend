@@ -1,0 +1,84 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: grind-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    command:
+      # Tuned for the Phase 0.2 numbers on a 4 vCPU / 8 GB box.
+      - "postgres"
+      - "-c"
+      - "max_connections=200"          # 120 from the app + PgBouncer + headroom
+      - "-c"
+      - "shared_buffers=2GB"           # ~25% of RAM
+      - "-c"
+      - "effective_cache_size=6GB"     # ~75% of RAM; planner hint only
+      - "-c"
+      - "work_mem=16MB"                # per sort/hash node — do not overdo it
+      - "-c"
+      - "maintenance_work_mem=512MB"
+      - "-c"
+      - "random_page_cost=1.1"         # SSD; the 4.0 default assumes spinning disks
+      - "-c"
+      - "log_min_duration_statement=1000"   # log anything over 1s
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: grind-redis
+    restart: unless-stopped
+    command:
+      # Cache + rate limits only: no data here is worth persisting, and
+      # allkeys-lru means a full Redis evicts instead of erroring.
+      - "redis-server"
+      - "--maxmemory"
+      - "512mb"
+      - "--maxmemory-policy"
+      - "allkeys-lru"
+      - "--save"
+      - ""
+      - "--appendonly"
+      - "no"
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  api:
+    build: .
+    container_name: grind-api
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      POSTGRES_HOST: postgres
+      REDIS_URL: redis://redis:6379/0
+      WEB_CONCURRENCY: 4
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: 2G
+
+volumes:
+  postgres_data:

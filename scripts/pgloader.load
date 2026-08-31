@@ -1,0 +1,25 @@
+/*
+ * Phase 3.4 — MySQL dumps -> Postgres.
+ *
+ * "data only" is deliberate: the Alembic baseline already created the tables
+ * with the hot-path partial indexes (PR-02, PR-29). Letting pgloader create
+ * the schema would drop those and rebuild plain MySQL-shaped tables instead.
+ *
+ * The schema rename is required because pgloader looks for a Postgres schema
+ * named after the MySQL database; our tables are in "public".
+ */
+LOAD DATABASE
+  FROM     mysql://root:temp@host.docker.internal:3307/grind_db
+  INTO postgresql://loader:loaderpw@host.docker.internal:5432/grind_db
+
+WITH data only,
+     truncate,
+     workers = 4,
+     concurrency = 1,
+     batch rows = 1000
+
+SET work_mem to '32MB',
+    maintenance_work_mem to '256MB'
+
+ALTER SCHEMA 'grind_db' RENAME TO 'public'
+;

@@ -1,0 +1,57 @@
+[project]
+name = "grind-api"
+version = "1.0.0"
+description = "GRIND fitness backend — FastAPI"
+readme = "README.md"
+requires-python = ">=3.12"
+
+dependencies = [
+    # web
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "gunicorn>=23.0.0",
+    "python-multipart>=0.0.12",   # legacy endpoints are form-POST; FastAPI needs this for Form()
+    "orjson>=3.10.0",             # 2-4x faster JSON serialisation than stdlib
+
+    # database
+    "sqlalchemy[asyncio]>=2.0.36",
+    "psycopg[binary,pool]>=3.2.0",
+    "alembic>=1.14.0",
+
+    # config / validation
+    "pydantic>=2.9.0",
+    "pydantic-settings>=2.6.0",
+    "email-validator>=2.2.0",     # PR-33 needs RFC-grade email validation
+
+    # infrastructure
+    "redis>=5.2.0",               # cache + shared rate-limit state
+    "httpx>=0.28.0",              # async Razorpay client
+
+    # security
+    "pyjwt>=2.10.0",
+    "argon2-cffi>=23.1.0",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.8.0",
+    "mypy>=1.13.0",
+]
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "S", "ASYNC"]
+ignore = ["S101"]  # assert is fine in tests
+
+[tool.ruff.lint.per-file-ignores]
+# Alembic writes these; reformatting generated code just causes churn on the
+# next autogenerate.
+"migrations/versions/*" = ["E501"]
+# CHECKS/EXPECTED_COUNTS are a wide lookup table — wrapping hurts readability.
+"scripts/reconcile.py" = ["E501"]
