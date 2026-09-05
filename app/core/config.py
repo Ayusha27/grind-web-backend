@@ -1,10 +1,12 @@
 from functools import lru_cache
 from typing import Literal
 from urllib.parse import quote_plus
-
+import os
+from dotenv import load_dotenv
 from pydantic import Field, computed_field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+load_dotenv()
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -30,10 +32,10 @@ class Settings(BaseSettings):
 
   # Database
     POSTGRES_USER: str
-    POSTGRES_PASSWORD: str
-    POSTGRES_HOST: str = "localhost"
+    POSTGRES_PASSWORD: str = os.getenv("POSTGRES_PASSWORD")
+    POSTGRES_HOST: str = os.getenv("POSTGRES_HOST")
     POSTGRES_PORT: int = 5432
-    POSTGRES_DB: str = "grind_db"
+    POSTGRES_DB: str = os.getenv("POSTGRES_DB")
 
    # Pool maths justified in Phase 0.2 step 3:
     #   4 workers x (20 + 10) = 120 connections against max_connections 200.
