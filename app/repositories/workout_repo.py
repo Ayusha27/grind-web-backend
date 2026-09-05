@@ -1,7 +1,7 @@
 # app/repositories/workout_repo.py
 from collections import defaultdict
 
-from sqlalchemy import distinct, func, nulls_first, select
+from sqlalchemy import distinct, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import WorkoutDay, WorkoutExercise, WorkoutLog, WorkoutPlan
@@ -36,7 +36,7 @@ async def get_days_with_exercises(
     day_stmt = (
         select(WorkoutDay)
         .where(WorkoutDay.plan_id == plan_id)
-        .order_by(nulls_first(WorkoutDay.day_number.asc()), WorkoutDay.id.asc())
+        .order_by(WorkoutDay.day_number.asc(), WorkoutDay.id.asc())
     )
     days = list((await db.execute(day_stmt)).scalars().all())
     if not days:
@@ -47,7 +47,7 @@ async def get_days_with_exercises(
         .where(WorkoutExercise.day_id.in_([d.id for d in days]))
         .order_by(
             WorkoutExercise.day_id.asc(),
-            nulls_first(WorkoutExercise.sort_order.asc()),
+            WorkoutExercise.sort_order.asc(),
             WorkoutExercise.id.asc(),
         )
     )

@@ -1,5 +1,5 @@
 # app/api/v1/workout.py
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, Request
 
 from app.api import openapi_ext
 from app.api.deps import BodyParams, DbSession
@@ -7,6 +7,7 @@ from app.cache.rate_limit import limit_write
 from app.cache.redis import cache_get_json, cache_set_json, workout_key
 from app.core.compat import php_intval
 from app.core.config import settings
+from app.integrations.mailer import send_workout_email
 from app.services import workout_service
 
 router = APIRouter(tags=["workout"])
@@ -18,7 +19,9 @@ router = APIRouter(tags=["workout"])
         {"client_id": "Client id. Absent or empty resolves to 1; non-numeric resolves to 0."}
     ),
 )
-async def get_workout(request: Request, db: DbSession) -> dict:
+async def get_workout(
+    request: Request, db: DbSession, background: BackgroundTasks
+) -> dict:
     """PR-01..PR-05. Cached: this is the highest-traffic endpoint in the app.
 
     The cache key uses the RESOLVED client_id, so ?client_id=abc and
@@ -31,10 +34,15 @@ async def get_workout(request: Request, db: DbSession) -> dict:
     key = workout_key(resolved)
     cached = await cache_get_json(key)
     if cached is not None:
+        # Queued, not awaited: the notification must never delay or fail the
+        # response. See send_workout_email() for the error strategy.
+        if settings.WORKOUT_EMAIL_ON_CACHE_HIT:
+            background.add_task(send_workout_email, cached, client_id=resolved, cached=True)
         return cached
 
     result = await workout_service.get_workout(db, raw)
     await cache_set_json(key, result, settings.CACHE_TTL_WORKOUT)
+    background.add_task(send_workout_email, result, client_id=resolved, cached=False)
     return result
 
 

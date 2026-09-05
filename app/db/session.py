@@ -8,27 +8,52 @@ from app.core.config import settings
 logger = logging.getLogger(__name__)
 
 
+def _statement_timeout_command() -> str:
+    """Server-side ceiling, as an init_command run on every new connection.
+
+    Same guarantee the Postgres `-c statement_timeout` option gave us: a slow
+    query can never hold a pool slot for longer than this, so one bad statement
+    cannot cascade (Phase 2.1). MySQL and MariaDB spell it differently and take
+    different units, hence DB_SERVER_FLAVOR.
+    """
+    ms = settings.DB_STATEMENT_TIMEOUT_MS
+    if settings.DB_SERVER_FLAVOR == "mariadb":
+        # MariaDB: max_statement_time, a double in SECONDS.
+        return f"SET SESSION max_statement_time={ms / 1000}"
+    # MySQL 5.7.8+ / 8.x: max_execution_time, an integer in MILLISECONDS.
+    # Caveat worth knowing: MySQL applies it to read-only SELECTs only, so it
+    # is a weaker guarantee than Postgres' statement_timeout was.
+    return f"SET SESSION max_execution_time={ms}"
+
+
 def _connect_args() -> dict[str, object]:
+    """Arguments forwarded to PyMySQL's Connection by the aiomysql dialect.
+
+    This is the pymysql.connect(...) call: host, port, user, password and
+    database come from the URL that SQLAlchemy parses out of
+    settings.DATABASE_URL, and the rest are passed through from here.
+    """
     args: dict[str, object] = {
-        # Server-side ceiling. A slow query can never hold a pool slot for
-        # longer than this, so one bad statement cannot cascade (Phase 2.1).
-        "options": f"-c statement_timeout={settings.DB_STATEMENT_TIMEOUT_MS}",
+        # pymysql.connect(connect_timeout=10) — seconds, socket connect only.
+        "connect_timeout": settings.DB_CONNECT_TIMEOUT,
     }
-    if settings.DB_USE_PGBOUNCER:
-        # PgBouncer transaction mode hands you a different backend per
-        # transaction, so server-side prepared statements break with
-        # "prepared statement _pg3_0 already exists". Disabling them is
-        # mandatory, not optional, once PgBouncer is in front.
-        args["prepare_threshold"] = None
+    if settings.DB_STATEMENT_TIMEOUT_MS > 0:
+        args["init_command"] = _statement_timeout_command()
     return args
 
 
+# The one and only engine. Driver is aiomysql, which is PyMySQL's asyncio
+# wrapper (it imports pymysql for the wire protocol), so every downstream
+# AsyncSession, repository and service keeps working untouched.
 engine = create_async_engine(
     settings.DATABASE_URL,
     echo=settings.DB_ECHO,
     pool_size=settings.DB_POOL_SIZE,
     max_overflow=settings.DB_MAX_OVERFLOW,
     pool_timeout=settings.DB_POOL_TIMEOUT,
+    # MySQL closes idle connections after wait_timeout (often 300s or less on
+    # shared hosting, vs Postgres leaving them open). Recycling below that
+    # ceiling is what prevents "MySQL server has gone away" on a quiet pool.
     pool_recycle=settings.DB_POOL_RECYCLE,
     pool_pre_ping=True,
     connect_args=_connect_args(),

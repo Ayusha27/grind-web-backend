@@ -1,12 +1,57 @@
+import os
 from functools import lru_cache
-from typing import Literal
+from typing import Any, Literal
 from urllib.parse import quote_plus
 import os
 from dotenv import load_dotenv
 from pydantic import Field, computed_field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import (
+    BaseSettings,
+    PydanticBaseSettingsSource,
+    SettingsConfigDict,
+)
+
+# The database credentials, and only these, are pinned to .env — see
+# Settings.settings_customise_sources below for why that needs enforcing.
+DB_CREDENTIAL_FIELDS = frozenset({
+    "DB_HOST", "DB_PORT", "DB_USER", "DB_PASSWORD", "DB_NAME",
+})
 
 load_dotenv()
+class _FilteredSource(PydanticBaseSettingsSource):
+    """Wraps a settings source, keeping or dropping a fixed set of field names.
+
+    Used in pairs: keep=True over the .env source and keep=False over the
+    process-environment source, which together make .env the sole origin of
+    a field while leaving every other setting's precedence untouched.
+    """
+
+    def __init__(
+        self,
+        settings_cls: type[BaseSettings],
+        inner: PydanticBaseSettingsSource,
+        fields: frozenset[str],
+        *,
+        keep: bool,
+    ) -> None:
+        super().__init__(settings_cls)
+        self._inner = inner
+        self._fields = fields
+        self._keep = keep
+
+    def get_field_value(self, field: Any, field_name: str) -> Any:
+        # Required by the ABC, but never called: __call__ is overridden and
+        # delegates whole-dict extraction to the wrapped source.
+        raise NotImplementedError
+
+    def __call__(self) -> dict[str, Any]:
+        # case_sensitive=False means the wrapped source lowercases its keys.
+        return {
+            key: value
+            for key, value in self._inner().items()
+            if (key.upper() in self._fields) is self._keep
+        }
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -30,22 +75,40 @@ class Settings(BaseSettings):
     ADMIN_USERNAME: str
     ADMIN_PASSWORD_HASH: str
 
-  # Database
-    POSTGRES_USER: str
-    POSTGRES_PASSWORD: str = os.getenv("POSTGRES_PASSWORD")
-    POSTGRES_HOST: str = os.getenv("POSTGRES_HOST")
-    POSTGRES_PORT: int = 5432
-    POSTGRES_DB: str = os.getenv("POSTGRES_DB")
+    # Database — BigRock MySQL.
+    # Read from .env and nowhere else (settings_customise_sources). No
+    # os.getenv() defaults either: os.getenv() returning None as the "default"
+    # for a str field turns a missing variable into a confusing validation
+    # error instead of a plain "field required".
+    DB_HOST: str = os.getenv("DB_HOST")
+    DB_PORT: int = os.getenv("DB_PORT")
+    DB_USER: str = os.getenv("DB_USER")
+    DB_PASSWORD: str = os.getenv("DB_PASSWORD")
+    DB_NAME: str = os.getenv("DB_NAME")
 
-   # Pool maths justified in Phase 0.2 step 3:
-    #   4 workers x (20 + 10) = 120 connections against max_connections 200.
+    # Socket-level connect timeout, handed to PyMySQL via aiomysql. Bounds how
+    # long a pool checkout can block when BigRock is unreachable, which matters
+    # far more now that the server is remote rather than a local container.
+    DB_CONNECT_TIMEOUT: int = 10
+    DB_CHARSET: str = "utf8mb4"           # utf8mb4 is the only sane MySQL charset
+
+    # Pool maths justified in Phase 0.2 step 3:
+    #   4 workers x (20 + 10) = 120 connections.
+    # NOTE: that ceiling was sized against a dedicated Postgres with
+    # max_connections=200. Shared BigRock MySQL plans commonly cap
+    # max_user_connections far lower — verify with
+    #   SHOW VARIABLES LIKE 'max_user_connections';
+    # and lower DB_POOL_SIZE/DB_MAX_OVERFLOW in .env if the cap is below ~120.
     DB_POOL_SIZE: int = 20
     DB_MAX_OVERFLOW: int = 10
     DB_POOL_TIMEOUT: int = 10             # seconds to wait for a free connection
-    DB_POOL_RECYCLE: int = 1800           # recycle before any 30-min idle reaper
+    DB_POOL_RECYCLE: int = 1800           # must stay under MySQL wait_timeout
     DB_ECHO: bool = False
     DB_STATEMENT_TIMEOUT_MS: int = 5000   # no single query may hog a pool slot
-    DB_USE_PGBOUNCER: bool = False        # disables prepared statements, see Phase 9.4
+    # MySQL spells the statement ceiling max_execution_time (ms); MariaDB spells
+    # it max_statement_time (seconds). Shared hosting is often MariaDB, and the
+    # wrong name makes every connection fail in init_command, so it is explicit.
+    DB_SERVER_FLAVOR: Literal["mysql", "mariadb"] = "mysql"
 
     #  redis
     REDIS_URL: str = "redis://localhost:6379/0"
@@ -80,6 +143,29 @@ class Settings(BaseSettings):
     MAIL_FROM: str = "GRIND Intake <noreply@trenddma.com>"
     INTAKE_RECIPIENT: str = "grindfit.ai@trenddma.com"
 
+    #  outlook notification for GET /api/v1/workout (PR-N/A, additive) 
+    # Deliberately a SEPARATE credential block from SMTP_* above: that one
+    # belongs to the intake mailer, and sharing it would couple two unrelated
+    # features to one mailbox.
+    #
+    # Default OFF. The endpoint is the highest-traffic route in the app and
+    # Microsoft 365 throttles at ~30 messages/minute per mailbox, so this must
+    # be switched on deliberately, with the recipient understood — see
+    # send_workout_email() for the full rate-limit note.
+    WORKOUT_EMAIL_ENABLED: bool = False
+    # True  -> mail on EVERY successful response, cache hits included.
+    # False -> mail only when the response was actually built from the DB,
+    #          which caps volume at roughly one message per client per
+    #          CACHE_TTL_WORKOUT (60s) instead of one per request.
+    WORKOUT_EMAIL_ON_CACHE_HIT: bool = True
+    OUTLOOK_HOST: str = os.getenv("OUTLOOK_HOST")
+    OUTLOOK_PORT: int = os.getenv("OUTLOOK_PORT")            # STARTTLS submission port
+    OUTLOOK_EMAIL: str = os.getenv("OUTLOOK_EMAIL")           # full mailbox address = SMTP username
+    OUTLOOK_PASSWORD: str = os.getenv("OUTLOOK_PASSWORD")         # app password if MFA is on
+    OUTLOOK_FROM: str = os.getenv("OUTLOOK_FROM")              # blank -> OUTLOOK_EMAIL
+    OUTLOOK_TO: str = os.getenv("OUTLOOK_TO")                # blank -> OUTLOOK_EMAIL
+    OUTLOOK_TIMEOUT: int = os.getenv("OUTLOOK_TIMEOUT")           # seconds for the whole SMTP exchange
+
     #  legacy parity switches (Decisions 3 & 4) 
     LEGACY_DEFAULT_CLIENT_ID: int = 1         # PR-01
     LEGACY_AFFILIATE_SKIP_EXPIRY: bool = True # PR-10 — validate ignores expiry
@@ -87,6 +173,37 @@ class Settings(BaseSettings):
     LEGACY_GLOBAL_PROGRESS_DENOMINATOR: bool = True # PR-28
     LEGACY_OPEN_ADMIN: bool = False           # Decision 3
 
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        """Pin the database credentials to .env.
+
+        pydantic-settings' default precedence is process environment > .env, so
+        a DB_HOST left exported in a shell, inherited from a parent process, or
+        injected by a docker-compose `environment:` block would silently
+        outrank the file and point the app at the wrong database. Hoisting a
+        .env-only source above the environment — and masking those same names
+        out of the environment source — makes .env the single origin for
+        DB_HOST/PORT/USER/PASSWORD/NAME.
+
+        Everything else keeps stock precedence, so the operational overrides
+        that are meant to come from the environment (REDIS_URL, LOG_LEVEL,
+        WEB_CONCURRENCY, pool sizes) still work.
+        """
+        return (
+            init_settings,
+            _FilteredSource(settings_cls, dotenv_settings, DB_CREDENTIAL_FIELDS, keep=True),
+            _FilteredSource(settings_cls, env_settings, DB_CREDENTIAL_FIELDS, keep=False),
+            dotenv_settings,
+            file_secret_settings,
+        )
 
     # Derived data
     @field_validator("ENV", mode="before")
@@ -108,13 +225,22 @@ class Settings(BaseSettings):
     @computed_field  # type: ignore[prop-decorator]
     @property
     def DATABASE_URL(self) -> str:
+        """SQLAlchemy DSN for BigRock MySQL.
+
+        aiomysql is PyMySQL's asyncio wrapper — it imports pymysql and reuses
+        its protocol implementation — so this is the PyMySQL driver, reached
+        through the one dialect that keeps AsyncSession working. Every route
+        depends on get_db() yielding an AsyncSession, so a synchronous
+        pymysql.connect() here would break all of them.
+        """
         # quote_plus: a password containing @ / : / # otherwise corrupts the
         # URL — "pw@2026" makes SQLAlchemy read the host as "2026@localhost".
-        user = quote_plus(self.POSTGRES_USER)
-        password = quote_plus(self.POSTGRES_PASSWORD)
+        user = quote_plus(self.DB_USER)
+        password = quote_plus(self.DB_PASSWORD)
         return (
-            f"postgresql+psycopg://{user}:{password}"
-            f"@{self.POSTGRES_HOST}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
+            f"mysql+aiomysql://{user}:{password}"
+            f"@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
+            f"?charset={self.DB_CHARSET}"
         )
 
     @computed_field  # type: ignore[prop-decorator]
