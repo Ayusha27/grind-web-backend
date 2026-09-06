@@ -14,9 +14,9 @@ from app.api.v1 import api_router
 from app.cache.redis import close_redis, get_redis
 from app.core.config import settings
 from app.core.exceptions import register_exception_handlers
-from app.core.logging import setup_logging
+from app.core.logging import setup_logging, setup_mail_log
 from app.core.responses import ORJSONResponse
-from app.db.session import SessionLocal, dispose_engine
+from app.db.session import SessionLocal, dispose_engine, ensure_applicants_table
 from app.integrations.razorpay_client import razorpay_client
 from app.middleware import RequestContextMiddleware, SecurityHeadersMiddleware
 
@@ -28,10 +28,28 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     setup_logging(settings.LOG_LEVEL, json_output=settings.IS_PROD)
     logger.info("startup", extra={"env": settings.ENV, "app": settings.APP_NAME})
 
+    if settings.MAIL_LOG_ENABLED:
+        mail_log = setup_mail_log(
+            settings.MAIL_LOG_PATH,
+            max_bytes=settings.MAIL_LOG_MAX_BYTES,
+            backup_count=settings.MAIL_LOG_BACKUP_COUNT,
+        )
+        # Path echoed at boot so the operator never has to guess where it went.
+        logger.info("mail_log_ready", extra={"path": str(mail_log)})
+
     # Warm the pool so the first user request does not pay connection setup.
     async with SessionLocal() as session:
         await session.execute(text("SELECT 1"))
     logger.info("db_ready")
+
+    if settings.APPLICANTS_AUTO_CREATE:
+        # Runs after the connectivity check above, so a DB that is simply
+        # unreachable fails there with a clear error rather than here inside DDL.
+        created = await ensure_applicants_table()
+        # NOT extra={"created": ...}: `created` is a reserved LogRecord field
+        # (the record's own timestamp) and logging raises KeyError rather than
+        # overwrite it. Same trap for name, module, filename, args, message.
+        logger.info("applicants_table_ready", extra={"table_created": created})
 
     try:
         await get_redis().ping()

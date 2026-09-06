@@ -28,11 +28,19 @@ def body(fields: Fields, *, required: list[str] | None = None) -> dict[str, Any]
     string because form encoding delivers strings and the services coerce with
     the PHP-compat helpers; declaring `integer` here would misrepresent what
     the endpoint actually accepts.
+
+    Every property carries an explicit empty example. Without one, Swagger UI
+    generates the literal text "string" for a bare {"type": "string"} and
+    "Try it out" posts that as the value — so an optional field left untouched
+    arrives as the five characters "string" rather than empty, and the
+    services' `or 'N/A'` fallbacks never fire. An empty example makes the
+    pre-filled body match what an unfilled form actually sends.
     """
     schema: dict[str, Any] = {
         "type": "object",
         "properties": {
-            name: {"type": "string", "description": desc} for name, desc in fields.items()
+            name: {"type": "string", "description": desc, "example": ""}
+            for name, desc in fields.items()
         },
     }
     if required:

@@ -1,4 +1,5 @@
 from app.db.models.affiliate import AffiliateCode, AffiliateConversion
+from app.db.models.applicant import Applicant
 from app.db.models.client import Client, ClientProgress
 from app.db.models.diet import DietPlan
 from app.db.models.enrollment import Enrollment
@@ -11,7 +12,7 @@ from app.db.models.workout import (
 )
 
 __all__ = [
-    "AffiliateCode", "AffiliateConversion", "Client", "ClientProgress",
+    "AffiliateCode", "AffiliateConversion", "Applicant", "Client", "ClientProgress",
     "DietPlan", "Enrollment", "WorkoutDay", "WorkoutExercise",
     "WorkoutLog", "WorkoutPlan", "WorkoutProgress",
 ]

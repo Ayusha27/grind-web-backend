@@ -141,16 +141,16 @@ class Settings(BaseSettings):
     SMTP_PASSWORD: str = ""
     SMTP_STARTTLS: bool = True
     MAIL_FROM: str = "GRIND Intake <noreply@trenddma.com>"
-    INTAKE_RECIPIENT: str = "grindfit.ai@trenddma.com"
+    INTAKE_RECIPIENT: str = os.getenv("GMAIL_EMAIL")
 
-    #  outlook notification for GET /api/v1/workout (PR-N/A, additive) 
+    #  gmail notification for GET /api/v1/workout (PR-N/A, additive)
     # Deliberately a SEPARATE credential block from SMTP_* above: that one
     # belongs to the intake mailer, and sharing it would couple two unrelated
     # features to one mailbox.
     #
     # Default OFF. The endpoint is the highest-traffic route in the app and
-    # Microsoft 365 throttles at ~30 messages/minute per mailbox, so this must
-    # be switched on deliberately, with the recipient understood — see
+    # Gmail caps a free account at ~500 recipients/day, so this must be
+    # switched on deliberately, with the recipient understood — see
     # send_workout_email() for the full rate-limit note.
     WORKOUT_EMAIL_ENABLED: bool = False
     # True  -> mail on EVERY successful response, cache hits included.
@@ -158,13 +158,38 @@ class Settings(BaseSettings):
     #          which caps volume at roughly one message per client per
     #          CACHE_TTL_WORKOUT (60s) instead of one per request.
     WORKOUT_EMAIL_ON_CACHE_HIT: bool = True
-    OUTLOOK_HOST: str = os.getenv("OUTLOOK_HOST")
-    OUTLOOK_PORT: int = os.getenv("OUTLOOK_PORT")            # STARTTLS submission port
-    OUTLOOK_EMAIL: str = os.getenv("OUTLOOK_EMAIL")           # full mailbox address = SMTP username
-    OUTLOOK_PASSWORD: str = os.getenv("OUTLOOK_PASSWORD")         # app password if MFA is on
-    OUTLOOK_FROM: str = os.getenv("OUTLOOK_FROM")              # blank -> OUTLOOK_EMAIL
-    OUTLOOK_TO: str = os.getenv("OUTLOOK_TO")                # blank -> OUTLOOK_EMAIL
-    OUTLOOK_TIMEOUT: int = os.getenv("OUTLOOK_TIMEOUT")           # seconds for the whole SMTP exchange
+    GMAIL_HOST: str = "smtp.gmail.com"
+    # 587 = STARTTLS submission, 465 = implicit TLS. _send_workout_sync picks
+    # the transport from this value, so either port works unchanged.
+    GMAIL_PORT: int = 587
+    GMAIL_EMAIL: str = os.getenv("GMAIL_EMAIL")         # full gmail address = SMTP username
+    GMAIL_PASSWORD: str = os.getenv("GMAIL_PASSWORD")     # 16-char App Password, NOT the account password
+    GMAIL_FROM: str = os.getenv("GMAIL_FROM")        # blank -> GMAIL_EMAIL
+    GMAIL_TO: str = os.getenv("GMAIL_TO")           # blank -> GMAIL_EMAIL
+    GMAIL_TIMEOUT: int = 15        # seconds for the whole SMTP exchange
+
+    #  applicants table (intake persistence)
+    # The table is created at startup if absent and left alone if present —
+    # see ensure_applicants_table() in app/db/session.py. Set false once the
+    # Alembic revision has been applied in a managed environment, so schema
+    # changes come from migrations only.
+    APPLICANTS_AUTO_CREATE: bool = True
+    # Retention window, stamped onto each row as expires_at at insert time.
+    # scripts/purge_applicants.py deletes rows whose expires_at has passed;
+    # a NULL expires_at is never purged (converted leads).
+    APPLICANT_RETENTION_DAYS: int = 30
+
+    #  mail log file (both mailers)
+    # Mail is fire-and-forget from a background task, so nothing about it ever
+    # reaches an HTTP status code. This file is the only durable answer to
+    # "did it send, and what was in it?" — see app/core/logging.py.
+    MAIL_LOG_ENABLED: bool = True
+    MAIL_LOG_PATH: str = "logs/mail.log"        # relative -> project root
+    # False keeps the audit trail (who/when/outcome) but drops the message text,
+    # for deployments where plan contents must not sit on disk.
+    MAIL_LOG_BODY: bool = True
+    MAIL_LOG_MAX_BYTES: int = 5_000_000         # ~5 MB per file before rotation
+    MAIL_LOG_BACKUP_COUNT: int = 3              # mail.log.1 .. mail.log.3
 
     #  legacy parity switches (Decisions 3 & 4) 
     LEGACY_DEFAULT_CLIENT_ID: int = 1         # PR-01
@@ -210,6 +235,20 @@ class Settings(BaseSettings):
     @classmethod
     def _lower_env(cls, v: str) -> str:
         return str(v).lower()
+
+    @field_validator("SMTP_PASSWORD", "GMAIL_PASSWORD", mode="before")
+    @classmethod
+    def _strip_app_password(cls, v: str | None) -> str:
+        """Drop whitespace from a Gmail app password.
+
+        Google presents app passwords as four space-separated groups of four
+        ("abcd efgh ijkl mnop") purely for legibility; the credential is the
+        16 characters. Pasted verbatim it authenticates as a 19-character
+        string and fails with 535, which reads exactly like a wrong password
+        and costs an hour to spot. Stripping here is safe: no SMTP password
+        may contain a space.
+        """
+        return "" if v is None else "".join(str(v).split())
 
     
     @computed_field  # type: ignore[prop-decorator]

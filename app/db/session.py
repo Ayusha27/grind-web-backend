@@ -1,6 +1,9 @@
 import logging
 from collections.abc import AsyncIterator
+from typing import Any
 
+from sqlalchemy import inspect as sa_inspect
+from sqlalchemy.exc import OperationalError, ProgrammingError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.core.config import settings
@@ -83,6 +86,48 @@ async def get_db() -> AsyncIterator[AsyncSession]:
         raise
     finally:
         await session.close()
+
+
+async def ensure_applicants_table() -> bool:
+    """Create `applicants` if it is missing; leave it untouched if it exists.
+
+    Returns True if this call created the table.
+
+    Scoped to one table on purpose. A bare create_all() would try to
+    materialise every model in Base.metadata against a live legacy database
+    that already owns those tables, which is not a thing to do at boot.
+
+    RACE: gunicorn starts one worker per core and they boot together, so two
+    workers can both see "absent" and both issue CREATE TABLE — checkfirst
+    does has_table THEN create, which is not atomic. The loser gets MySQL 1050
+    "table already exists", which is the outcome we wanted anyway, so it is
+    swallowed. Any other DDL failure is logged and re-raised: a missing table
+    means every intake submission fails, and that should stop the boot.
+
+    LIMITATION: this only ever creates. A table that already exists with an
+    older column set is used as-is and inserts fail later on the missing
+    column; create-if-missing cannot detect drift. The Alembic revision is the
+    answer for a managed environment — set APPLICANTS_AUTO_CREATE=false there.
+    """
+    from app.db.models import Applicant  # local: avoids a circular import at module load
+
+    def _create(connection: Any) -> bool:
+        inspector = sa_inspect(connection)
+        if inspector.has_table(Applicant.__tablename__):
+            return False
+        Applicant.__table__.create(connection)
+        return True
+
+    async with engine.begin() as connection:
+        try:
+            return await connection.run_sync(_create)
+        except (ProgrammingError, OperationalError) as exc:
+            # 1050 = ER_TABLE_EXISTS_ERROR. Another worker won the race.
+            if getattr(exc.orig, "args", (None,))[0] == 1050:
+                logger.info("applicants_table_created_by_peer")
+                return False
+            logger.exception("applicants_table_create_failed")
+            raise
 
 
 async def dispose_engine() -> None:
