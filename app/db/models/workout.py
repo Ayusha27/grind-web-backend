@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Index, Integer, String, Text, func
+from sqlalchemy import Boolean, DateTime, Float, Index, Integer, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -70,32 +70,81 @@ class WorkoutLog(Base):
     __tablename__ = "workout_logs"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_email: Mapped[str] = mapped_column(String(255), nullable=False)
-    month_no: Mapped[int] = mapped_column(Integer, nullable=False)
-    week_no: Mapped[int] = mapped_column(Integer, nullable=False)
-    day_id: Mapped[int] = mapped_column(Integer, nullable=False)
-    exercise_id: Mapped[int] = mapped_column(Integer, nullable=False)
-    set_no: Mapped[int] = mapped_column(Integer, nullable=False)
-    completed: Mapped[bool | None] = mapped_column(Boolean, server_default="false")
+
+    # Existing legacy field.
+    # Kept so existing /workout/complete and /workout/logs
+    # continue to work.
+    user_email: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+    )
+
+    # New workout-session owner.
+    client_id: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+    )
+
+    month_no: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+    )
+
+    week_no: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+    )
+
+    day_id: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+    )
+
+    # Existing legacy set-level fields.
+    # Nullable because the NEW implementation does not store
+    # exercise/set rows.
+    exercise_id: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+    )
+
+    set_no: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+    )
+
+    completed: Mapped[bool | None] = mapped_column(
+        Boolean,
+        server_default="false",
+        nullable=True,
+    )
+
+    # New summary-level fields.
+    total_sets: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+    )
+
+    completed_sets: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+    )
+
+    completion_percent: Mapped[float | None] = mapped_column(
+        Float,
+        nullable=True,
+    )
+
+    calories_burned: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+    )
+
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), nullable=False
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
     )
-
-    __table_args__ = (
-        # THE hot table: ~200k rows/day at target load (Phase 0.2 step 5).
-        # PR-29 runs COUNT(DISTINCT exercise_id) WHERE user_email=? AND completed=1
-        # on every portal load. Without this it is a full scan of tens of millions
-        # of rows, per page view. This single index is the difference between
-        # 2 ms and 8 s on that query.
-        Index(
-            "ix_workout_logs_user_completed_ex",
-            "user_email",
-            "exercise_id",
-            postgresql_where=(completed.is_(True)),
-        ),
-        Index("ix_workout_logs_user_created", "user_email", "created_at"),
-    )
-
 
 class WorkoutProgress(Base):
     """Present in the legacy schema; no PHP file reads or writes it.

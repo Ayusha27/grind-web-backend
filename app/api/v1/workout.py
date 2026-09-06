@@ -8,6 +8,7 @@ from app.cache.redis import cache_get_json, cache_set_json, workout_key
 from app.core.compat import php_intval
 from app.core.config import settings
 from app.services import workout_service
+from app.schemas.workout import WorkoutLogCreate
 
 router = APIRouter(tags=["workout"])
 
@@ -74,3 +75,20 @@ async def complete_workout(payload: BodyParams, db: DbSession) -> dict:
 async def save_log(payload: BodyParams, db: DbSession) -> dict:
     """Repairs the dead save-progress.php."""
     return await workout_service.save_log(db, payload)
+
+
+
+@router.post(
+    "/workout/log",
+    dependencies=[Depends(limit_write)],
+)
+async def log_workout(
+    payload: WorkoutLogCreate,
+    db: DbSession,
+) -> dict:
+    """Save one final workout session summary."""
+
+    return await workout_service.save_workout_summary(
+        db,
+        payload,
+    )
