@@ -257,6 +257,26 @@ async def get_workout_summary_progress(
 
 
 
+async def count_active_plan_days(db: AsyncSession, client_id: int) -> int:
+    """Number of workout days in the client's active plan.
+
+    This is the tracker's workouts-per-week figure. Returns 0 when the client
+    has no active plan or the plan has no days; the caller substitutes the
+    configured default in that case.
+    """
+    # Mirrors get_active_plan: a client may have more than one row flagged
+    # active, and the newest one wins, so count the days of THAT plan only.
+    latest_plan = (
+        select(WorkoutPlan.id)
+        .where(WorkoutPlan.client_id == client_id, WorkoutPlan.is_active.is_(True))
+        .order_by(WorkoutPlan.id.desc())
+        .limit(1)
+        .scalar_subquery()
+    )
+    stmt = select(func.count(WorkoutDay.id)).where(WorkoutDay.plan_id == latest_plan)
+    return int((await db.execute(stmt)).scalar() or 0)
+
+
 async def get_workout_summary_details(
     db: AsyncSession,
     client_id: int,

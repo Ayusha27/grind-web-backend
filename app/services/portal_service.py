@@ -56,101 +56,204 @@ async def _resolve_client(db: AsyncSession, token: str):
 #     return {"total": total, "completed": completed, "percent": percent}
 
 
-async def _progress_percent(
-    db: AsyncSession,
-    client_id: int,
-) -> dict[str, int]:
+def _session_denominators(plan_days: int) -> tuple[int, int, int]:
+    """(workouts per week, weeks per month, sessions per month).
+
+    The tracker counts SESSIONS — one completed workout day is one session —
+    so a 4-week month of a 5-day plan is 20 sessions. The per-week figure comes
+    from the client's own active plan; the configured default only fills in for
+    a client who has no plan days yet.
     """
-    Calculate workout progress from the new summary-based
-    workout_logs records.
+    per_week = plan_days or settings.WORKOUT_DEFAULT_WORKOUTS_PER_WEEK
+    weeks = settings.WORKOUT_WEEKS_PER_MONTH
+    return per_week, weeks, per_week * weeks
 
-    Each logged workout contains:
-        total_sets
-        completed_sets
 
-    Only summary rows are considered.
-    Legacy set-level workout_logs rows are ignored.
+def _percent(part: int, whole: int) -> int:
+    """Clamped percentage. PHP round() is half-away-from-zero (Phase 2.4)."""
+    if whole <= 0:
+        return 0
+    return php_round_int(min(part, whole) / whole * 100)
+
+
+async def _workout_progress(db: AsyncSession, client_id: int) -> dict[str, Any]:
+    """Session-based progress for the tracker.
+
+    Every summary row in workout_logs is one logged workout DAY. The four
+    tracker slots are:
+
+      1. sessions completed / sessions in the month  (1/20 = 5%)
+      2. calories burned, and calories / completed sessions
+      3. same pair, exposed under `overall` for the whole plan to date
+      4. weeks touched / weeks in the month, and the best week's score, where
+         a week in which all `per_week` workouts were done scores 100%
+
+    Set counts are still returned, under `sets`, because they are what the
+    logging endpoint writes — they are just no longer what the tracker shows.
     """
+    logs = await workout_repo.get_workout_summary_details(db, client_id)
+    plan_days = await workout_repo.count_active_plan_days(db, client_id)
+    per_week, weeks_per_month, per_month = _session_denominators(plan_days)
 
-    return await workout_repo.get_workout_summary_progress(
-        db,
-        client_id,
-    )
-
-async def _workout_progress_details(
-    db: AsyncSession,
-    client_id: int,
-) -> dict[str, Any]:
-    """Calculate weekly workout progress from summary workout logs."""
-
-    logs = await workout_repo.get_workout_summary_details(
-        db,
-        client_id,
-    )
-
-    weekly_detail: dict[str, Any] = {}
-    total_calories = 0
+    weekly_detail: dict[str, dict[str, dict[str, Any]]] = {}
+    total_sets = 0
+    completed_sets = 0
 
     for log in logs:
         month_key = str(log.month_no)
         week_key = str(log.week_no)
         day_key = str(log.day_id)
 
-        calories = int(log.calories_burned or 0)
-        total_calories += calories
+        row_total = int(log.total_sets or 0)
+        row_done = int(log.completed_sets or 0)
+        total_sets += row_total
+        completed_sets += row_done
 
-        weekly_detail.setdefault(month_key, {})
-        weekly_detail[month_key].setdefault(week_key, {})
+        if log.completion_percent is not None:
+            row_percent = float(log.completion_percent)
+        elif row_total > 0:
+            row_percent = row_done / row_total * 100
+        else:
+            row_percent = 0.0
 
-        weekly_detail[month_key][week_key][day_key] = {
-            "completed": (
-                (log.completed_sets or 0) >= (log.total_sets or 0)
-                and (log.total_sets or 0) > 0
-            ),
-            "completion_percent": float(
-                log.completion_percent or 0
-            ),
+        day = (
+            weekly_detail
+            .setdefault(month_key, {})
+            .setdefault(week_key, {})
+            .setdefault(
+                day_key,
+                {"completed": False, "completion_percent": 0.0, "calories_burned": 0},
+            )
+        )
+        # A day can hold more than one row if the client re-logged it. The work
+        # done adds up, but the day is still ONE session, and the best attempt
+        # decides whether that session counts as finished.
+        day["calories_burned"] += int(log.calories_burned or 0)
+        day["completion_percent"] = max(day["completion_percent"], row_percent)
+        day["completed"] = day["completed"] or (row_done >= row_total and row_total > 0)
+
+    months: dict[str, dict[str, Any]] = {}
+
+    for month_key, month_data in weekly_detail.items():
+        sessions_completed = 0
+        sessions_logged = 0
+        calories = 0
+        weeks_completed = 0
+        weeks_logged = 0
+        best_week_score = 0
+
+        for week_data in month_data.values():
+            week_completed = sum(1 for d in week_data.values() if d["completed"])
+            week_logged = sum(
+                1 for d in week_data.values() if d["completion_percent"] > 0
+            )
+            calories += sum(d["calories_burned"] for d in week_data.values())
+
+            sessions_completed += week_completed
+            sessions_logged += week_logged
+            weeks_completed += 1 if week_completed > 0 else 0
+            weeks_logged += 1 if week_logged > 0 else 0
+            best_week_score = max(best_week_score, _percent(week_completed, per_week))
+
+        months[month_key] = {
+            "month_no": int(month_key),
+            # slot 1
+            "sessions_completed": sessions_completed,
+            "sessions_logged": sessions_logged,
+            "sessions_total": per_month,
+            "percent": _percent(sessions_completed, per_month),
+            # slots 2 and 3
             "calories_burned": calories,
+            "avg_calories_per_session": (
+                php_round_int(calories / sessions_completed)
+                if sessions_completed
+                else 0
+            ),
+            # slot 4
+            "weeks_completed": weeks_completed,
+            "weeks_logged": weeks_logged,
+            "weeks_total": weeks_per_month,
+            "best_week_score": best_week_score,
         }
 
-    active_weeks = 0
-    best_week_score = 0
+    # The month the tracker opens on: the newest one with any logs.
+    active_month_no = max((int(k) for k in months), default=1)
+    active = months.get(
+        str(active_month_no),
+        {
+            "month_no": active_month_no,
+            "sessions_completed": 0,
+            "sessions_logged": 0,
+            "sessions_total": per_month,
+            "percent": 0,
+            "calories_burned": 0,
+            "avg_calories_per_session": 0,
+            "weeks_completed": 0,
+            "weeks_logged": 0,
+            "weeks_total": weeks_per_month,
+            "best_week_score": 0,
+        },
+    )
 
-    for month_data in weekly_detail.values():
-        for week_data in month_data.values():
+    overall_sessions = sum(m["sessions_completed"] for m in months.values())
+    overall_calories = sum(m["calories_burned"] for m in months.values())
+    # Months elapsed, not months logged: a client who skipped month 2 entirely
+    # is still three months into the plan by month 3.
+    months_span = max((int(k) for k in months), default=0)
+    overall_total = per_month * months_span
 
-            completed_sessions = sum(
-                1
-                for day_data in week_data.values()
-                if day_data["completion_percent"] > 0
-            )
-
-            if completed_sessions > 0:
-                active_weeks += 1
-
-            # Current plan has 5 workout sessions per week.
-            week_score = php_round_int(
-                (completed_sessions / 5) * 100
-            )
-
-            best_week_score = max(
-                best_week_score,
-                week_score,
-            )
+    overall = {
+        "sessions_completed": overall_sessions,
+        "sessions_total": overall_total,
+        "percent": _percent(overall_sessions, overall_total),
+        "calories_burned": overall_calories,
+        "avg_calories_per_session": (
+            php_round_int(overall_calories / overall_sessions)
+            if overall_sessions
+            else 0
+        ),
+        "months_tracked": months_span,
+    }
 
     return {
-        "calories_burned": total_calories,
-        "active_weeks": active_weeks,
-        "best_week_score": best_week_score,
+        "plan": {
+            "workouts_per_week": per_week,
+            "weeks_per_month": weeks_per_month,
+            "sessions_per_month": per_month,
+        },
+        "month": active,
+        "months": months,
+        "overall": overall,
+        "sets": {
+            "total": total_sets,
+            "completed": completed_sets,
+            "percent": _percent(completed_sets, total_sets),
+        },
         "weekly_detail": weekly_detail,
     }
+
+
+async def _progress_percent(db: AsyncSession, client_id: int) -> dict[str, int]:
+    """The my-plan.php progress block, in the tracker's session terms.
+
+    Same key names the page already reads — `total`, `completed`, `percent` —
+    but they now count sessions out of the month's 20, not sets out of every
+    set ever logged.
+    """
+    progress = await _workout_progress(db, client_id)
+    month = progress["month"]
+
+    return {
+        "total": month["sessions_total"],
+        "completed": month["sessions_completed"],
+        "percent": month["percent"],
+        "calories_burned": month["calories_burned"],
+    }
+
 async def get_my_plan(db: AsyncSession, token: str) -> dict[str, Any]:
     """my-plan.php — the full portal payload."""
     client = await _resolve_client(db, token)
-    progress = await _progress_percent(
-    db,
-    client.id
-)
+    progress = await _progress_percent(db, client.id)
 
     plan = await workout_repo.get_active_plan(db, client.id)
     days_payload: list[dict[str, Any]] = []
@@ -214,14 +317,8 @@ def _f(value: Decimal | None) -> float | None:
 async def get_progress(db: AsyncSession, token: str) -> dict[str, Any]:
     """workout-progress.php — PR-32."""
     client = await _resolve_client(db, token)
-    progress = await _progress_percent(
-    db,
-    client.id
-)
-    workout_details = await _workout_progress_details(
-    db,
-    client.id
-)
+    progress = await _workout_progress(db, client.id)
+    month = progress["month"]
 
     history = await client_repo.get_progress_history(db, client.id)
 
@@ -242,15 +339,28 @@ async def get_progress(db: AsyncSession, token: str) -> dict[str, Any]:
     return {
         "success": True,
         "data": {
+            # Slot 1. The key stays `exercises` because that is what the
+            # tracker reads, but the numbers are SESSIONS out of the month's
+            # 20 now — one finished workout day is 1/20, i.e. 5%.
             "exercises": {
-                "total": progress["total"],
-                "completed": progress["completed"],
-                "percent": progress["percent"],
+                "total": month["sessions_total"],
+                "completed": month["sessions_completed"],
+                "percent": month["percent"],
             },
-            "calories_burned": workout_details["calories_burned"],
-            "active_weeks": workout_details["active_weeks"],
-            "best_week_score": workout_details["best_week_score"],
-            "weekly_detail": workout_details["weekly_detail"],
+            # Slots 2 and 3.
+            "calories_burned": month["calories_burned"],
+            "avg_calories_per_session": month["avg_calories_per_session"],
+            # Slot 4 — weeks touched this month, and the best week's score.
+            "active_weeks": month["weeks_completed"],
+            "weeks_total": month["weeks_total"],
+            "best_week_score": month["best_week_score"],
+            "weekly_detail": progress["weekly_detail"],
+            # Everything above is the active month. These carry the rest.
+            "plan": progress["plan"],
+            "month": month,
+            "months": progress["months"],
+            "overall": progress["overall"],
+            "sets": progress["sets"],
             "current": {
                 "weight": _f(current.weight), "waist": _f(current.waist),
                 "chest": _f(current.chest), "arms": _f(current.arms),

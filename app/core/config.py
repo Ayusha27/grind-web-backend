@@ -118,6 +118,15 @@ class Settings(BaseSettings):
     CACHE_TTL_EXERCISE_COUNT: int = 300   # PR-28 global COUNT(*), pure seq scan
     RATE_LIMIT_ENABLED: bool = True
 
+    #  progress tracker (portal /progress, /my-plan)
+    # The tracker counts SESSIONS, not sets: one completed workout day is one
+    # session. A month is WORKOUT_WEEKS_PER_MONTH weeks of
+    # WORKOUT_DEFAULT_WORKOUTS_PER_WEEK workouts, i.e. 4 x 5 = 20 sessions.
+    # The per-week figure is taken from the client's active plan when it has
+    # days defined; this default only applies when it does not.
+    WORKOUT_WEEKS_PER_MONTH: int = 4
+    WORKOUT_DEFAULT_WORKOUTS_PER_WEEK: int = 5
+
     #  networking 
     CORS_ORIGINS_RAW: str = Field("http://localhost:5173", alias="CORS_ORIGINS")
     TRUSTED_HOSTS_RAW: str = Field("*", alias="TRUSTED_HOSTS")
