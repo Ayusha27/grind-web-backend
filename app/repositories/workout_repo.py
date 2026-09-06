@@ -5,7 +5,7 @@ from sqlalchemy import distinct, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import WorkoutDay, WorkoutExercise, WorkoutLog, WorkoutPlan
-
+from app.core.compat import php_round_int
 
 async def get_active_plan(db: AsyncSession, client_id: int) -> WorkoutPlan | None:
     """PR-02.
@@ -84,6 +84,40 @@ async def insert_log(
     await db.flush()
     return log
 
+
+async def insert_workout_summary(
+    db: AsyncSession,
+    *,
+    client_id: int,
+    month_no: int,
+    week_no: int,
+    day_id: int,
+    total_sets: int,
+    completed_sets: int,
+    completion_percent: float,
+    calories_burned: int,
+) -> WorkoutLog:
+    log = WorkoutLog(
+        client_id=client_id,
+        month_no=month_no,
+        week_no=week_no,
+        day_id=day_id,
+        total_sets=total_sets,
+        completed_sets=completed_sets,
+        completion_percent=completion_percent,
+        calories_burned=calories_burned,
+
+        # New summary row doesn't represent a particular set.
+        exercise_id=None,
+        set_no=None,
+        completed=None,
+        user_email=None,
+    )
+
+    db.add(log)
+    await db.flush()
+
+    return log
 
 async def count_all_exercises(db: AsyncSession) -> int:
     """PR-28 denominator.
@@ -182,3 +216,73 @@ async def insert_exercises(
         return
     db.add_all([WorkoutExercise(day_id=day_id, **row) for row in rows])  # type: ignore[arg-type]
     await db.flush()
+
+
+async def get_workout_summary_progress(
+    db: AsyncSession,
+    client_id: int,
+) -> dict[str, int]:
+    result = await db.execute(
+        select(
+            func.coalesce(func.sum(WorkoutLog.total_sets), 0),
+            func.coalesce(func.sum(WorkoutLog.completed_sets), 0),
+            func.coalesce(func.sum(WorkoutLog.calories_burned), 0),
+        )
+        .where(
+            WorkoutLog.client_id == client_id,
+            WorkoutLog.total_sets.is_not(None),
+            WorkoutLog.completed_sets.is_not(None),
+        )
+    )
+
+    total_sets, completed_sets, calories_burned = result.one()
+
+    total_sets = int(total_sets or 0)
+    completed_sets = int(completed_sets or 0)
+    calories_burned = int(calories_burned or 0)
+
+    if total_sets > 0:
+        percent = php_round_int(
+            completed_sets / total_sets * 100
+        )
+    else:
+        percent = 0
+
+    return {
+        "total": total_sets,
+        "completed": completed_sets,
+        "percent": percent,
+        "calories_burned": calories_burned,
+    }
+
+
+
+async def get_workout_summary_details(
+    db: AsyncSession,
+    client_id: int,
+) -> list[WorkoutLog]:
+    """
+    Return summary-based workout logs for a client.
+
+    Only the new summary rows are returned.
+    Legacy set-level workout_logs rows are ignored.
+    """
+
+    stmt = (
+        select(WorkoutLog)
+        .where(
+            WorkoutLog.client_id == client_id,
+            WorkoutLog.total_sets.is_not(None),
+            WorkoutLog.completed_sets.is_not(None),
+        )
+        .order_by(
+            WorkoutLog.month_no.asc(),
+            WorkoutLog.week_no.asc(),
+            WorkoutLog.day_id.asc(),
+            WorkoutLog.id.asc(),
+        )
+    )
+
+    result = await db.execute(stmt)
+
+    return list(result.scalars().all())

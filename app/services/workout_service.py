@@ -9,6 +9,7 @@ from app.core.config import settings
 from app.core.exceptions import ValidationFailure
 from app.db.models import WorkoutDay, WorkoutExercise, WorkoutPlan
 from app.repositories import workout_repo
+from app.schemas.workout import WorkoutLogCreate
 
 logger = logging.getLogger(__name__)
 
@@ -135,3 +136,48 @@ async def save_log(db: AsyncSession, payload: dict[str, Any]) -> dict[str, Any]:
     )
     await db.commit()
     return {"success": True}
+
+async def save_workout_summary(
+    db: AsyncSession,
+    payload: WorkoutLogCreate,
+) -> dict[str, Any]:
+    """Save one final workout summary.
+
+    One API call = one database row.
+    """
+
+    if payload.completed_sets > payload.total_sets:
+        raise ValidationFailure(
+            "Completed sets cannot exceed total sets"
+        )
+
+    if payload.total_sets == 0:
+        calculated_percent = 0.0
+    else:
+        calculated_percent = (
+            payload.completed_sets / payload.total_sets
+        ) * 100
+
+    # Don't trust a potentially incorrect percentage from the frontend.
+    # Use the actual set counts as the source of truth.
+    calculated_percent = round(calculated_percent, 2)
+
+    log = await workout_repo.insert_workout_summary(
+        db,
+        client_id=payload.client_id,
+        month_no=payload.month_no,
+        week_no=payload.week_no,
+        day_id=payload.day_id,
+        total_sets=payload.total_sets,
+        completed_sets=payload.completed_sets,
+        completion_percent=calculated_percent,
+        calories_burned=payload.calories_burned,
+    )
+
+    await db.commit()
+
+    return {
+        "success": True,
+        "message": "Workout logged successfully",
+        "log_id": log.id,
+    }

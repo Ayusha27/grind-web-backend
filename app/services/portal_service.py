@@ -33,33 +33,124 @@ async def _resolve_client(db: AsyncSession, token: str):
     return client
 
 
-async def _progress_percent(db: AsyncSession, user_email: str) -> dict[str, int]:
-    """PR-28, PR-29.
+# async def _progress_percent(db: AsyncSession, user_email: str) -> dict[str, int]:
+#     """PR-28, PR-29.
 
-    The denominator is COUNT(*) over the ENTIRE workout_exercises table, not
-    the client's own plan. Every client's percentage therefore shrinks each
-    time any other client's plan is imported. It is a bug; Decision 4 keeps
-    it; Phase 7 caches the count so keeping it is free.
+#     The denominator is COUNT(*) over the ENTIRE workout_exercises table, not
+#     the client's own plan. Every client's percentage therefore shrinks each
+#     time any other client's plan is imported. It is a bug; Decision 4 keeps
+#     it; Phase 7 caches the count so keeping it is free.
+#     """
+#     from app.cache.redis import cached_exercise_count
+
+#     if settings.LEGACY_GLOBAL_PROGRESS_DENOMINATOR:
+#         total = await cached_exercise_count(db)
+#     else:
+#         total = await cached_exercise_count(db)  # swap for a per-plan count here
+
+#     completed = await workout_repo.count_completed_exercises(db, user_email)
+
+#     # PHP round() is half-away-from-zero; Python's builtin is not (Phase 2.4).
+#     percent = php_round_int(completed / total * 100) if total > 0 else 0
+
+#     return {"total": total, "completed": completed, "percent": percent}
+
+
+async def _progress_percent(
+    db: AsyncSession,
+    client_id: int,
+) -> dict[str, int]:
     """
-    from app.cache.redis import cached_exercise_count
+    Calculate workout progress from the new summary-based
+    workout_logs records.
 
-    if settings.LEGACY_GLOBAL_PROGRESS_DENOMINATOR:
-        total = await cached_exercise_count(db)
-    else:
-        total = await cached_exercise_count(db)  # swap for a per-plan count here
+    Each logged workout contains:
+        total_sets
+        completed_sets
 
-    completed = await workout_repo.count_completed_exercises(db, user_email)
+    Only summary rows are considered.
+    Legacy set-level workout_logs rows are ignored.
+    """
 
-    # PHP round() is half-away-from-zero; Python's builtin is not (Phase 2.4).
-    percent = php_round_int(completed / total * 100) if total > 0 else 0
+    return await workout_repo.get_workout_summary_progress(
+        db,
+        client_id,
+    )
 
-    return {"total": total, "completed": completed, "percent": percent}
+async def _workout_progress_details(
+    db: AsyncSession,
+    client_id: int,
+) -> dict[str, Any]:
+    """Calculate weekly workout progress from summary workout logs."""
 
+    logs = await workout_repo.get_workout_summary_details(
+        db,
+        client_id,
+    )
 
+    weekly_detail: dict[str, Any] = {}
+    total_calories = 0
+
+    for log in logs:
+        month_key = str(log.month_no)
+        week_key = str(log.week_no)
+        day_key = str(log.day_id)
+
+        calories = int(log.calories_burned or 0)
+        total_calories += calories
+
+        weekly_detail.setdefault(month_key, {})
+        weekly_detail[month_key].setdefault(week_key, {})
+
+        weekly_detail[month_key][week_key][day_key] = {
+            "completed": (
+                (log.completed_sets or 0) >= (log.total_sets or 0)
+                and (log.total_sets or 0) > 0
+            ),
+            "completion_percent": float(
+                log.completion_percent or 0
+            ),
+            "calories_burned": calories,
+        }
+
+    active_weeks = 0
+    best_week_score = 0
+
+    for month_data in weekly_detail.values():
+        for week_data in month_data.values():
+
+            completed_sessions = sum(
+                1
+                for day_data in week_data.values()
+                if day_data["completion_percent"] > 0
+            )
+
+            if completed_sessions > 0:
+                active_weeks += 1
+
+            # Current plan has 5 workout sessions per week.
+            week_score = php_round_int(
+                (completed_sessions / 5) * 100
+            )
+
+            best_week_score = max(
+                best_week_score,
+                week_score,
+            )
+
+    return {
+        "calories_burned": total_calories,
+        "active_weeks": active_weeks,
+        "best_week_score": best_week_score,
+        "weekly_detail": weekly_detail,
+    }
 async def get_my_plan(db: AsyncSession, token: str) -> dict[str, Any]:
     """my-plan.php — the full portal payload."""
     client = await _resolve_client(db, token)
-    progress = await _progress_percent(db, client.email or "")
+    progress = await _progress_percent(
+    db,
+    client.id
+)
 
     plan = await workout_repo.get_active_plan(db, client.id)
     days_payload: list[dict[str, Any]] = []
@@ -123,7 +214,14 @@ def _f(value: Decimal | None) -> float | None:
 async def get_progress(db: AsyncSession, token: str) -> dict[str, Any]:
     """workout-progress.php — PR-32."""
     client = await _resolve_client(db, token)
-    progress = await _progress_percent(db, client.email or "")
+    progress = await _progress_percent(
+    db,
+    client.id
+)
+    workout_details = await _workout_progress_details(
+    db,
+    client.id
+)
 
     history = await client_repo.get_progress_history(db, client.id)
 
@@ -144,7 +242,15 @@ async def get_progress(db: AsyncSession, token: str) -> dict[str, Any]:
     return {
         "success": True,
         "data": {
-            "exercises": progress,
+            "exercises": {
+                "total": progress["total"],
+                "completed": progress["completed"],
+                "percent": progress["percent"],
+            },
+            "calories_burned": workout_details["calories_burned"],
+            "active_weeks": workout_details["active_weeks"],
+            "best_week_score": workout_details["best_week_score"],
+            "weekly_detail": workout_details["weekly_detail"],
             "current": {
                 "weight": _f(current.weight), "waist": _f(current.waist),
                 "chest": _f(current.chest), "arms": _f(current.arms),
