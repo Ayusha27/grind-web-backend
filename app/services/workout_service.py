@@ -10,6 +10,9 @@ from app.core.exceptions import ValidationFailure
 from app.db.models import WorkoutDay, WorkoutExercise, WorkoutPlan
 from app.repositories import workout_repo
 from app.schemas.workout import WorkoutLogCreate
+from app.schemas.workout import (
+    WorkoutSetLogCreate,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -141,10 +144,7 @@ async def save_workout_summary(
     db: AsyncSession,
     payload: WorkoutLogCreate,
 ) -> dict[str, Any]:
-    """Save one final workout summary.
-
-    One API call = one database row.
-    """
+    """Save one workout summary and all individual set states."""
 
     if payload.completed_sets > payload.total_sets:
         raise ValidationFailure(
@@ -155,12 +155,31 @@ async def save_workout_summary(
         calculated_percent = 0.0
     else:
         calculated_percent = (
-            payload.completed_sets / payload.total_sets
+            payload.completed_sets /
+            payload.total_sets
         ) * 100
 
-    # Don't trust a potentially incorrect percentage from the frontend.
-    # Use the actual set counts as the source of truth.
-    calculated_percent = round(calculated_percent, 2)
+    calculated_percent = round(
+        calculated_percent,
+        2,
+    )
+
+    # ---------------------------------------------------------
+    # Save individual set states
+    # ---------------------------------------------------------
+
+    set_logs = await workout_repo.upsert_workout_sets(
+        db,
+        client_id=payload.client_id,
+        month_no=payload.month_no,
+        week_no=payload.week_no,
+        day_id=payload.day_id,
+        sets=payload.sets,
+    )
+
+    # ---------------------------------------------------------
+    # Save workout summary
+    # ---------------------------------------------------------
 
     log = await workout_repo.insert_workout_summary(
         db,
@@ -174,10 +193,81 @@ async def save_workout_summary(
         calories_burned=payload.calories_burned,
     )
 
+    # ---------------------------------------------------------
+    # One transaction
+    # ---------------------------------------------------------
+
     await db.commit()
 
     return {
         "success": True,
         "message": "Workout logged successfully",
         "log_id": log.id,
+        "sets_logged": len(set_logs),
     }
+
+
+async def save_workout_set(
+    db: AsyncSession,
+    *,
+    client_id: int,
+    payload: WorkoutSetLogCreate,
+) -> dict[str, Any]:
+    """Save or update one workout set completion state."""
+
+    log = await workout_repo.upsert_workout_set(
+        db,
+        client_id=client_id,
+        month_no=payload.month_no,
+        week_no=payload.week_no,
+        day_id=payload.day_id,
+        exercise_id=payload.exercise_id,
+        set_no=payload.set_no,
+        completed=payload.completed,
+    )
+
+    await db.commit()
+
+    return {
+        "success": True,
+        "id": log.id,
+        "client_id": log.client_id,
+        "month_no": log.month_no,
+        "week_no": log.week_no,
+        "day_id": log.day_id,
+        "exercise_id": log.exercise_id,
+        "set_no": log.set_no,
+        "completed": log.completed,
+    }
+
+async def get_workout_sets(
+    db: AsyncSession,
+    *,
+    client_id: int,
+    month_no: int,
+    week_no: int,
+    day_id: int,
+) -> list[dict[str, Any]]:
+    """Return saved set completion states for one workout day."""
+
+    logs = await workout_repo.get_workout_sets(
+        db,
+        client_id=client_id,
+        month_no=month_no,
+        week_no=week_no,
+        day_id=day_id,
+    )
+
+    return [
+        {
+            "id": log.id,
+            "client_id": log.client_id,
+            "month_no": log.month_no,
+            "week_no": log.week_no,
+            "day_id": log.day_id,
+            "exercise_id": log.exercise_id,
+            "set_no": log.set_no,
+            "completed": log.completed,
+        }
+        for log in logs
+    ]

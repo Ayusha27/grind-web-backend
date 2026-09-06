@@ -2,14 +2,17 @@
 from fastapi import APIRouter, BackgroundTasks, Depends, Request
 
 from app.api import openapi_ext
-from app.api.deps import BodyParams, DbSession
+from app.api.deps import BodyParams, CurrentClient, DbSession
 from app.cache.rate_limit import limit_write
 from app.cache.redis import cache_get_json, cache_set_json, workout_key
 from app.core.compat import php_intval
 from app.core.config import settings
 from app.integrations.mailer import send_workout_email
 from app.services import workout_service
-from app.schemas.workout import WorkoutLogCreate
+from app.schemas.workout import (
+    WorkoutLogCreate,
+    WorkoutSetLogCreate,
+)
 
 router = APIRouter(tags=["workout"])
 
@@ -100,3 +103,44 @@ async def log_workout(
         db,
         payload,
     )
+
+
+@router.post(
+    "/workout/set",
+    dependencies=[Depends(limit_write)],
+)
+async def log_workout_set(
+    payload: WorkoutSetLogCreate,
+    client: CurrentClient,
+    db: DbSession,
+) -> dict:
+    """Save one workout set completion state."""
+
+    return await workout_service.save_workout_set(
+        db,
+        client_id=client.id,
+        payload=payload,
+    )
+
+@router.get("/workout/sets")
+async def get_workout_sets(
+    month_no: int,
+    week_no: int,
+    day_id: int,
+    client: CurrentClient,
+    db: DbSession,
+) -> dict:
+    """Return saved set completion states for one workout day."""
+
+    sets = await workout_service.get_workout_sets(
+        db,
+        client_id=client.id,
+        month_no=month_no,
+        week_no=week_no,
+        day_id=day_id,
+    )
+
+    return {
+        "success": True,
+        "sets": sets,
+    }

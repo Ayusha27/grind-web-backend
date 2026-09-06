@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import WorkoutDay, WorkoutExercise, WorkoutLog, WorkoutPlan
 from app.core.compat import php_round_int
+from app.db.models.workout import WorkoutSetLog
 
 async def get_active_plan(db: AsyncSession, client_id: int) -> WorkoutPlan | None:
     """PR-02.
@@ -111,7 +112,6 @@ async def insert_workout_summary(
         exercise_id=None,
         set_no=None,
         completed=None,
-        user_email=None,
     )
 
     db.add(log)
@@ -306,3 +306,135 @@ async def get_workout_summary_details(
     result = await db.execute(stmt)
 
     return list(result.scalars().all())
+
+
+async def upsert_workout_set(
+    db: AsyncSession,
+    *,
+    client_id: int,
+    month_no: int,
+    week_no: int,
+    day_id: int,
+    exercise_id: int,
+    set_no: int,
+    completed: bool,
+) -> WorkoutSetLog:
+    """Create or update the completion state of one workout set."""
+
+    stmt = select(WorkoutSetLog).where(
+        WorkoutSetLog.client_id == client_id,
+        WorkoutSetLog.month_no == month_no,
+        WorkoutSetLog.week_no == week_no,
+        WorkoutSetLog.day_id == day_id,
+        WorkoutSetLog.exercise_id == exercise_id,
+        WorkoutSetLog.set_no == set_no,
+    )
+
+    result = await db.execute(stmt)
+    existing = result.scalar_one_or_none()
+
+    if existing is not None:
+        existing.completed = completed
+        return existing
+
+    log = WorkoutSetLog(
+        client_id=client_id,
+        month_no=month_no,
+        week_no=week_no,
+        day_id=day_id,
+        exercise_id=exercise_id,
+        set_no=set_no,
+        completed=completed,
+    )
+
+    db.add(log)
+    await db.flush()
+
+    return log
+
+
+async def get_workout_sets(
+    db: AsyncSession,
+    *,
+    client_id: int,
+    month_no: int,
+    week_no: int,
+    day_id: int,
+) -> list[WorkoutSetLog]:
+    """Return all saved set logs for one workout day."""
+
+    stmt = (
+        select(WorkoutSetLog)
+        .where(
+            WorkoutSetLog.client_id == client_id,
+            WorkoutSetLog.month_no == month_no,
+            WorkoutSetLog.week_no == week_no,
+            WorkoutSetLog.day_id == day_id,
+        )
+        .order_by(
+            WorkoutSetLog.exercise_id,
+            WorkoutSetLog.set_no,
+        )
+    )
+
+    result = await db.execute(stmt)
+
+    return list(result.scalars().all())
+
+
+async def get_workout_sets_for_month(
+    db: AsyncSession,
+    *,
+    client_id: int,
+    month_no: int,
+) -> list[WorkoutSetLog]:
+    """Return all set logs for one client and month."""
+
+    stmt = (
+        select(WorkoutSetLog)
+        .where(
+            WorkoutSetLog.client_id == client_id,
+            WorkoutSetLog.month_no == month_no,
+        )
+        .order_by(
+            WorkoutSetLog.week_no,
+            WorkoutSetLog.day_id,
+            WorkoutSetLog.exercise_id,
+            WorkoutSetLog.set_no,
+        )
+    )
+
+    result = await db.execute(stmt)
+
+    return list(result.scalars().all())
+
+
+
+async def upsert_workout_sets(
+    db: AsyncSession,
+    *,
+    client_id: int,
+    month_no: int,
+    week_no: int,
+    day_id: int,
+    sets: list,
+) -> list[WorkoutSetLog]:
+    """Create or update all sets for one workout."""
+
+    logs: list[WorkoutSetLog] = []
+
+    for workout_set in sets:
+        log = await upsert_workout_set(
+            db,
+            client_id=client_id,
+            month_no=month_no,
+            week_no=week_no,
+            day_id=day_id,
+            exercise_id=workout_set.exercise_id,
+            set_no=workout_set.set_no,
+            completed=workout_set.completed,
+        )
+
+        logs.append(log)
+
+    return logs
