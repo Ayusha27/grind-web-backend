@@ -9,10 +9,21 @@ from app.db.models.workout import (
     WorkoutLog,
     WorkoutPlan,
     WorkoutProgress,
+    WorkoutSetLog,
 )
 
 __all__ = [
-    "AffiliateCode", "AffiliateConversion", "Applicant", "Client", "ClientProgress",
-    "DietPlan", "Enrollment", "WorkoutDay", "WorkoutExercise",
-    "WorkoutLog", "WorkoutPlan", "WorkoutProgress",
+    "AffiliateCode",
+    "AffiliateConversion",
+    "Applicant",
+    "Client",
+    "ClientProgress",
+    "DietPlan",
+    "Enrollment",
+    "WorkoutDay",
+    "WorkoutExercise",
+    "WorkoutLog",
+    "WorkoutPlan",
+    "WorkoutProgress",
+    "WorkoutSetLog",
 ]
