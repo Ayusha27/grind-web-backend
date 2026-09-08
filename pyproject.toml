@@ -7,12 +7,11 @@ requires-python = ">=3.12"
 
 dependencies = [
     # web
-    "fastapi>=0.115.0",
+    "fastapi[standard]>=0.115.0",
     "uvicorn[standard]>=0.32.0",
     "gunicorn>=23.0.0",
     "python-multipart>=0.0.12",   # legacy endpoints are form-POST; FastAPI needs this for Form()
     "orjson>=3.10.0",             # 2-4x faster JSON serialisation than stdlib
-
     # database — BigRock MySQL
     "sqlalchemy[asyncio]>=2.0.36",
     # aiomysql IS the PyMySQL driver: it imports pymysql for the wire protocol
@@ -24,16 +23,13 @@ dependencies = [
     # it the handshake fails with "cryptography is required for sha256_password".
     "cryptography>=43.0.0",
     "alembic>=1.14.0",
-
     # config / validation
     "pydantic>=2.9.0",
     "pydantic-settings>=2.6.0",
     "email-validator>=2.2.0",     # PR-33 needs RFC-grade email validation
-
     # infrastructure
     "redis>=5.2.0",               # cache + shared rate-limit state
     "httpx>=0.28.0",              # async Razorpay client
-
     # security
     "pyjwt>=2.10.0",
     "argon2-cffi>=23.1.0",
