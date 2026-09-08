@@ -1,56 +1,16 @@
 import os
 from functools import lru_cache
-from typing import Any, Literal
+from typing import Literal
 from urllib.parse import quote_plus
-import os
+
 from dotenv import load_dotenv
 from pydantic import Field, computed_field, field_validator
 from pydantic_settings import (
     BaseSettings,
-    PydanticBaseSettingsSource,
     SettingsConfigDict,
 )
 
-# The database credentials, and only these, are pinned to .env — see
-# Settings.settings_customise_sources below for why that needs enforcing.
-DB_CREDENTIAL_FIELDS = frozenset({
-    "DB_HOST", "DB_PORT", "DB_USER", "DB_PASSWORD", "DB_NAME",
-})
-
 load_dotenv()
-class _FilteredSource(PydanticBaseSettingsSource):
-    """Wraps a settings source, keeping or dropping a fixed set of field names.
-
-    Used in pairs: keep=True over the .env source and keep=False over the
-    process-environment source, which together make .env the sole origin of
-    a field while leaving every other setting's precedence untouched.
-    """
-
-    def __init__(
-        self,
-        settings_cls: type[BaseSettings],
-        inner: PydanticBaseSettingsSource,
-        fields: frozenset[str],
-        *,
-        keep: bool,
-    ) -> None:
-        super().__init__(settings_cls)
-        self._inner = inner
-        self._fields = fields
-        self._keep = keep
-
-    def get_field_value(self, field: Any, field_name: str) -> Any:
-        # Required by the ABC, but never called: __call__ is overridden and
-        # delegates whole-dict extraction to the wrapped source.
-        raise NotImplementedError
-
-    def __call__(self) -> dict[str, Any]:
-        # case_sensitive=False means the wrapped source lowercases its keys.
-        return {
-            key: value
-            for key, value in self._inner().items()
-            if (key.upper() in self._fields) is self._keep
-        }
 
 
 class Settings(BaseSettings):
@@ -80,11 +40,11 @@ class Settings(BaseSettings):
     # os.getenv() defaults either: os.getenv() returning None as the "default"
     # for a str field turns a missing variable into a confusing validation
     # error instead of a plain "field required".
-    DB_HOST: str = os.getenv("DB_HOST")
-    DB_PORT: int = os.getenv("DB_PORT")
-    DB_USER: str = os.getenv("DB_USER")
-    DB_PASSWORD: str = os.getenv("DB_PASSWORD")
-    DB_NAME: str = os.getenv("DB_NAME")
+    DB_HOST: str
+    DB_PORT: int
+    DB_USER: str
+    DB_PASSWORD: str
+    DB_NAME: str
 
     # Socket-level connect timeout, handed to PyMySQL via aiomysql. Bounds how
     # long a pool checkout can block when BigRock is unreachable, which matters
@@ -208,37 +168,6 @@ class Settings(BaseSettings):
     LEGACY_OPEN_ADMIN: bool = False           # Decision 3
 
 
-    @classmethod
-    def settings_customise_sources(
-        cls,
-        settings_cls: type[BaseSettings],
-        init_settings: PydanticBaseSettingsSource,
-        env_settings: PydanticBaseSettingsSource,
-        dotenv_settings: PydanticBaseSettingsSource,
-        file_secret_settings: PydanticBaseSettingsSource,
-    ) -> tuple[PydanticBaseSettingsSource, ...]:
-        """Pin the database credentials to .env.
-
-        pydantic-settings' default precedence is process environment > .env, so
-        a DB_HOST left exported in a shell, inherited from a parent process, or
-        injected by a docker-compose `environment:` block would silently
-        outrank the file and point the app at the wrong database. Hoisting a
-        .env-only source above the environment — and masking those same names
-        out of the environment source — makes .env the single origin for
-        DB_HOST/PORT/USER/PASSWORD/NAME.
-
-        Everything else keeps stock precedence, so the operational overrides
-        that are meant to come from the environment (REDIS_URL, LOG_LEVEL,
-        WEB_CONCURRENCY, pool sizes) still work.
-        """
-        return (
-            init_settings,
-            _FilteredSource(settings_cls, dotenv_settings, DB_CREDENTIAL_FIELDS, keep=True),
-            _FilteredSource(settings_cls, env_settings, DB_CREDENTIAL_FIELDS, keep=False),
-            dotenv_settings,
-            file_secret_settings,
-        )
-
     # Derived data
     @field_validator("ENV", mode="before")
     @classmethod
@@ -303,4 +232,3 @@ def get_settings() -> Settings:
 
 
 settings = get_settings()
-
