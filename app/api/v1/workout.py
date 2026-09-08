@@ -1,76 +1,193 @@
-# app/api/v1/workout.py
-from fastapi import APIRouter, Depends, Request
+from typing import Any
 
-from app.api import openapi_ext
-from app.api.deps import BodyParams, DbSession
-from app.cache.rate_limit import limit_write
-from app.cache.redis import cache_get_json, cache_set_json, workout_key
-from app.core.compat import php_intval
-from app.core.config import settings
+from fastapi import APIRouter, Depends, Query
+
+from app.api.deps import CurrentClient, DbSession
+from app.schemas.workout import (
+    WorkoutLogCreate,
+    WorkoutLogResponse,
+    WorkoutSetLogCreate,
+)
 from app.services import workout_service
 
-router = APIRouter(tags=["workout"])
+router = APIRouter()
 
 
-@router.get(
-    "/workout",
-    openapi_extra=openapi_ext.query(
-        {"client_id": "Client id. Absent or empty resolves to 1; non-numeric resolves to 0."}
-    ),
-)
-async def get_workout(request: Request, db: DbSession) -> dict:
-    """PR-01..PR-05. Cached: this is the highest-traffic endpoint in the app.
+# =====================================================================
+# LEGACY WORKOUT ENDPOINTS
+# =====================================================================
 
-    The cache key uses the RESOLVED client_id, so ?client_id=abc and
-    ?client_id=0 share one entry (both resolve to 0 under PR-01) — which is
-    correct, because they must return the same body.
+
+@router.get("/workout")
+async def get_workout(
+    db: DbSession,
+    client_id: Any = Query(default=None),
+) -> dict[str, Any]:
     """
-    raw = request.query_params.get("client_id")
-    resolved = settings.LEGACY_DEFAULT_CLIENT_ID if raw is None or raw == "" else php_intval(raw)
+    Return the active workout plan.
 
-    key = workout_key(resolved)
-    cached = await cache_get_json(key)
-    if cached is not None:
-        return cached
+    This preserves the existing GET /workout contract.
+    """
 
-    result = await workout_service.get_workout(db, raw)
-    await cache_set_json(key, result, settings.CACHE_TTL_WORKOUT)
-    return result
+    return await workout_service.get_workout(
+        db,
+        client_id,
+    )
 
 
 @router.post(
     "/workout/complete",
-    dependencies=[Depends(limit_write)],
-    openapi_extra=openapi_ext.body(
-        {
-            "exercise_id": "Exercise row id. Must resolve > 0.",
-            "day_id": "Day row id. Must resolve > 0.",
-            "user_email": "Client email. Must be non-empty after trim.",
-        },
-        required=["exercise_id", "day_id", "user_email"],
-    ),
 )
-async def complete_workout(payload: BodyParams, db: DbSession) -> dict:
-    """PR-06..PR-09."""
-    return await workout_service.complete_workout(db, payload)
+async def complete_workout(
+    payload: dict[str, Any],
+    db: DbSession,
+) -> dict[str, Any]:
+    """
+    Legacy workout completion endpoint.
+
+    Kept for backwards compatibility with the original PHP-compatible API.
+    """
+
+    return await workout_service.complete_workout(
+        db,
+        payload,
+    )
 
 
 @router.post(
     "/workout/logs",
-    dependencies=[Depends(limit_write)],
-    openapi_extra=openapi_ext.body(
-        {
-            "email": "Client email. NOTE: this route uses email, not user_email.",
-            "month": "Month number. Defaults to 1.",
-            "week": "Week number. Defaults to 1.",
-            "day": "Day row id. NOTE: day, not day_id. Defaults to 0.",
-            "exercise": "Exercise row id. NOTE: exercise, not exercise_id. Defaults to 0.",
-            "set": "Set number. Defaults to 1.",
-            "completed": "Truthy value marks the set complete.",
-        },
-        required=["email"],
-    ),
 )
-async def save_log(payload: BodyParams, db: DbSession) -> dict:
-    """Repairs the dead save-progress.php."""
-    return await workout_service.save_log(db, payload)
+async def save_workout_log(
+    payload: dict[str, Any],
+    db: DbSession,
+) -> dict[str, Any]:
+    """
+    Legacy set-level workout log endpoint.
+
+    Kept unchanged so existing clients do not break.
+    """
+
+    return await workout_service.save_log(
+        db,
+        payload,
+    )
+
+
+# =====================================================================
+# MIGRATED WORKOUT SUMMARY
+# =====================================================================
+
+
+@router.post(
+    "/workout/log",
+    response_model=WorkoutLogResponse,
+)
+async def log_workout(
+    payload: WorkoutLogCreate,
+    client: CurrentClient,
+    db: DbSession,
+) -> WorkoutLogResponse:
+    """
+    Save one complete workout-day state.
+
+    The authenticated client is resolved from:
+
+        ?token=<access_token>
+
+    or:
+
+        Authorization: Bearer <access_token>
+
+    The backend is responsible for calculating:
+
+        total_sets
+        completed_sets
+        completion_percent
+        calories_burned
+
+    from:
+
+        active workout plan
+        +
+        submitted set states
+
+    The summary row is upserted by:
+
+        client_id
+        + month_no
+        + week_no
+        + day_id
+    """
+
+    return await workout_service.save_workout_summary(
+        db,
+        payload,
+        client_id=client.id,
+    )
+
+
+# =====================================================================
+# MIGRATED INDIVIDUAL SET STATE
+# =====================================================================
+
+
+@router.post(
+    "/workout/set",
+)
+async def log_workout_set(
+    payload: WorkoutSetLogCreate,
+    client: CurrentClient,
+    db: DbSession,
+) -> dict[str, Any]:
+    """
+    Save or update one individual workout set.
+
+    The client ID is obtained from CurrentClient rather than from the
+    request payload.
+
+    This writes to workout_set_logs.
+
+    It does not create a day summary by itself.
+    """
+
+    return await workout_service.save_workout_set(
+        db,
+        client_id=client.id,
+        payload=payload,
+    )
+
+
+# =====================================================================
+# READ INDIVIDUAL SET STATES
+# =====================================================================
+
+
+@router.get("/workout/sets")
+async def get_workout_sets(
+    db: DbSession,
+    client: CurrentClient,
+    month_no: int = Query(gt=0),
+    week_no: int = Query(gt=0),
+    day_id: int = Query(gt=0),
+) -> dict[str, Any]:
+    """
+    Return saved individual set states for one workout day.
+
+    The client ID is resolved from the authenticated access token.
+
+    This allows the frontend to restore checkbox/set completion state
+    after a page refresh.
+    """
+
+    sets = await workout_service.get_workout_sets(
+        db,
+        client_id=client.id,
+        month_no=month_no,
+        week_no=week_no,
+        day_id=day_id,
+    )
+
+    return {
+        "success": True,
+        "data": sets,
+    }

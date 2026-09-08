@@ -14,9 +14,9 @@ from app.api.v1 import api_router
 from app.cache.redis import close_redis, get_redis
 from app.core.config import settings
 from app.core.exceptions import register_exception_handlers
-from app.core.logging import setup_logging
+from app.core.logging import setup_logging, setup_mail_log
 from app.core.responses import ORJSONResponse
-from app.db.session import SessionLocal, dispose_engine
+from app.db.session import SessionLocal, dispose_engine, ensure_applicants_table
 from app.integrations.razorpay_client import razorpay_client
 from app.middleware import RequestContextMiddleware, SecurityHeadersMiddleware
 
@@ -28,24 +28,57 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     setup_logging(settings.LOG_LEVEL, json_output=settings.IS_PROD)
     logger.info("startup", extra={"env": settings.ENV, "app": settings.APP_NAME})
 
+    if settings.MAIL_LOG_ENABLED:
+        mail_log = setup_mail_log(
+            settings.MAIL_LOG_PATH,
+            max_bytes=settings.MAIL_LOG_MAX_BYTES,
+            backup_count=settings.MAIL_LOG_BACKUP_COUNT,
+        )
+        # Path echoed at boot so the operator never has to guess where it went.
+        logger.info("mail_log_ready", extra={"path": str(mail_log)})
+
     # Warm the pool so the first user request does not pay connection setup.
     async with SessionLocal() as session:
         await session.execute(text("SELECT 1"))
     logger.info("db_ready")
 
-    try:
-        await get_redis().ping()
-        logger.info("redis_ready")
-    except Exception:
-        # Cache is optional by design (Phase 6.2) — boot anyway, degraded.
-        logger.warning("redis_unavailable_at_startup")
+    if settings.APPLICANTS_AUTO_CREATE:
+        # Runs after the connectivity check above, so a DB that is simply
+        # unreachable fails there with a clear error rather than here inside DDL.
+        created = await ensure_applicants_table()
+        # NOT extra={"created": ...}: `created` is a reserved LogRecord field
+        # (the record's own timestamp) and logging raises KeyError rather than
+        # overwrite it. Same trap for name, module, filename, args, message.
+        logger.info("applicants_table_ready", extra={"table_created": created})
+
+    # Redis is optional.
+    # Only try to connect when cache or rate limiting is enabled.
+    if settings.CACHE_ENABLED or settings.RATE_LIMIT_ENABLED:
+        try:
+            await get_redis().ping()
+            logger.info("redis_ready")
+        except Exception:
+            # Redis is optional. The application can continue without it.
+            logger.warning("redis_unavailable_at_startup")
+    else:
+        logger.info(
+            "redis_disabled",
+            extra={
+                "cache_enabled": settings.CACHE_ENABLED,
+                "rate_limit_enabled": settings.RATE_LIMIT_ENABLED,
+            },
+        )
 
     yield
 
-    # Ordered shutdown: stop outbound HTTP, then cache, then the DB pool, so
-    # in-flight work can still finish writing.
+    # Ordered shutdown: stop outbound HTTP, then cache, then the DB pool,
+    # so in-flight work can still finish writing.
     await razorpay_client.aclose()
-    await close_redis()
+
+    # Only close Redis if Redis functionality was enabled.
+    if settings.CACHE_ENABLED or settings.RATE_LIMIT_ENABLED:
+        await close_redis()
+
     await dispose_engine()
     logger.info("shutdown_complete")
 
@@ -56,6 +89,7 @@ def create_app() -> FastAPI:
         version="1.0.0",
         lifespan=lifespan,
         default_response_class=ORJSONResponse,   # 2-4x faster serialisation
+
         # No interactive docs in production: they advertise every endpoint
         # and their schemas to anyone who finds the host.
         docs_url=None if settings.IS_PROD else "/docs",
@@ -67,6 +101,7 @@ def create_app() -> FastAPI:
     # OUTERMOST so every other layer, including error handlers, has the id.
     app.add_middleware(GZipMiddleware, minimum_size=1000)
     app.add_middleware(SecurityHeadersMiddleware)
+
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.CORS_ORIGINS,   # never "*" with credentials
@@ -76,8 +111,13 @@ def create_app() -> FastAPI:
         expose_headers=["X-Request-ID"],
         max_age=3600,                          # cache preflights for an hour
     )
+
     if settings.TRUSTED_HOSTS != ["*"]:
-        app.add_middleware(TrustedHostMiddleware, allowed_hosts=settings.TRUSTED_HOSTS)
+        app.add_middleware(
+            TrustedHostMiddleware,
+            allowed_hosts=settings.TRUSTED_HOSTS,
+        )
+
     app.add_middleware(RequestContextMiddleware)
 
     register_exception_handlers(app)
@@ -97,10 +137,15 @@ def create_app() -> FastAPI:
 
     @app.get("/health/ready", tags=["ops"], include_in_schema=False)
     async def ready() -> dict:
-        """READINESS. Checks dependencies, so a pod that cannot serve is
-        removed from the load balancer without being restarted.
+        """READINESS. Checks required dependencies.
+
+        MySQL is required for the application.
+        Redis is optional and is only checked when cache or rate limiting
+        is enabled.
         """
         checks: dict[str, str] = {}
+
+        # MySQL / database check
         try:
             async with SessionLocal() as session:
                 await session.execute(text("SELECT 1"))
@@ -109,15 +154,23 @@ def create_app() -> FastAPI:
             logger.exception("readiness_db_failed")
             checks["database"] = "error"
 
-        try:
-            await get_redis().ping()
-            checks["redis"] = "ok"
-        except Exception:
-            # Degraded, NOT unready — the app serves correctly without cache.
-            checks["redis"] = "degraded"
+        # Redis check
+        # Redis is not required when both cache and rate limiting are disabled.
+        if settings.CACHE_ENABLED or settings.RATE_LIMIT_ENABLED:
+            try:
+                await get_redis().ping()
+                checks["redis"] = "ok"
+            except Exception:
+                checks["redis"] = "degraded"
+        else:
+            checks["redis"] = "disabled"
 
         status = "ok" if checks["database"] == "ok" else "error"
-        return {"status": status, "checks": checks}
+
+        return {
+            "status": status,
+            "checks": checks,
+        }
 
     return app
 

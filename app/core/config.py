@@ -1,9 +1,16 @@
+import os
 from functools import lru_cache
 from typing import Literal
 from urllib.parse import quote_plus
 
+from dotenv import load_dotenv
 from pydantic import Field, computed_field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import (
+    BaseSettings,
+    SettingsConfigDict,
+)
+
+load_dotenv()
 
 
 class Settings(BaseSettings):
@@ -28,22 +35,40 @@ class Settings(BaseSettings):
     ADMIN_USERNAME: str
     ADMIN_PASSWORD_HASH: str
 
-  # Database
-    POSTGRES_USER: str
-    POSTGRES_PASSWORD: str
-    POSTGRES_HOST: str = "localhost"
-    POSTGRES_PORT: int = 5432
-    POSTGRES_DB: str = "grind_db"
+    # Database — BigRock MySQL.
+    # Read from .env and nowhere else (settings_customise_sources). No
+    # os.getenv() defaults either: os.getenv() returning None as the "default"
+    # for a str field turns a missing variable into a confusing validation
+    # error instead of a plain "field required".
+    DB_HOST: str
+    DB_PORT: int
+    DB_USER: str
+    DB_PASSWORD: str
+    DB_NAME: str
 
-   # Pool maths justified in Phase 0.2 step 3:
-    #   4 workers x (20 + 10) = 120 connections against max_connections 200.
+    # Socket-level connect timeout, handed to PyMySQL via aiomysql. Bounds how
+    # long a pool checkout can block when BigRock is unreachable, which matters
+    # far more now that the server is remote rather than a local container.
+    DB_CONNECT_TIMEOUT: int = 10
+    DB_CHARSET: str = "utf8mb4"           # utf8mb4 is the only sane MySQL charset
+
+    # Pool maths justified in Phase 0.2 step 3:
+    #   4 workers x (20 + 10) = 120 connections.
+    # NOTE: that ceiling was sized against a dedicated Postgres with
+    # max_connections=200. Shared BigRock MySQL plans commonly cap
+    # max_user_connections far lower — verify with
+    #   SHOW VARIABLES LIKE 'max_user_connections';
+    # and lower DB_POOL_SIZE/DB_MAX_OVERFLOW in .env if the cap is below ~120.
     DB_POOL_SIZE: int = 20
     DB_MAX_OVERFLOW: int = 10
     DB_POOL_TIMEOUT: int = 10             # seconds to wait for a free connection
-    DB_POOL_RECYCLE: int = 1800           # recycle before any 30-min idle reaper
+    DB_POOL_RECYCLE: int = 1800           # must stay under MySQL wait_timeout
     DB_ECHO: bool = False
     DB_STATEMENT_TIMEOUT_MS: int = 5000   # no single query may hog a pool slot
-    DB_USE_PGBOUNCER: bool = False        # disables prepared statements, see Phase 9.4
+    # MySQL spells the statement ceiling max_execution_time (ms); MariaDB spells
+    # it max_statement_time (seconds). Shared hosting is often MariaDB, and the
+    # wrong name makes every connection fail in init_command, so it is explicit.
+    DB_SERVER_FLAVOR: Literal["mysql", "mariadb"] = "mysql"
 
     #  redis
     REDIS_URL: str = "redis://localhost:6379/0"
@@ -52,6 +77,15 @@ class Settings(BaseSettings):
     CACHE_TTL_WORKOUT: int = 60           # plans change ~monthly; 60s is very safe
     CACHE_TTL_EXERCISE_COUNT: int = 300   # PR-28 global COUNT(*), pure seq scan
     RATE_LIMIT_ENABLED: bool = True
+
+    #  progress tracker (portal /progress, /my-plan)
+    # The tracker counts SESSIONS, not sets: one completed workout day is one
+    # session. A month is WORKOUT_WEEKS_PER_MONTH weeks of
+    # WORKOUT_DEFAULT_WORKOUTS_PER_WEEK workouts, i.e. 4 x 5 = 20 sessions.
+    # The per-week figure is taken from the client's active plan when it has
+    # days defined; this default only applies when it does not.
+    WORKOUT_WEEKS_PER_MONTH: int = 4
+    WORKOUT_DEFAULT_WORKOUTS_PER_WEEK: int = 5
 
     #  networking 
     CORS_ORIGINS_RAW: str = Field("http://localhost:5173", alias="CORS_ORIGINS")
@@ -76,7 +110,55 @@ class Settings(BaseSettings):
     SMTP_PASSWORD: str = ""
     SMTP_STARTTLS: bool = True
     MAIL_FROM: str = "GRIND Intake <noreply@trenddma.com>"
-    INTAKE_RECIPIENT: str = "grindfit.ai@trenddma.com"
+    INTAKE_RECIPIENT: str = os.getenv("GMAIL_EMAIL")
+
+    #  gmail notification for GET /api/v1/workout (PR-N/A, additive)
+    # Deliberately a SEPARATE credential block from SMTP_* above: that one
+    # belongs to the intake mailer, and sharing it would couple two unrelated
+    # features to one mailbox.
+    #
+    # Default OFF. The endpoint is the highest-traffic route in the app and
+    # Gmail caps a free account at ~500 recipients/day, so this must be
+    # switched on deliberately, with the recipient understood — see
+    # send_workout_email() for the full rate-limit note.
+    WORKOUT_EMAIL_ENABLED: bool = False
+    # True  -> mail on EVERY successful response, cache hits included.
+    # False -> mail only when the response was actually built from the DB,
+    #          which caps volume at roughly one message per client per
+    #          CACHE_TTL_WORKOUT (60s) instead of one per request.
+    WORKOUT_EMAIL_ON_CACHE_HIT: bool = True
+    GMAIL_HOST: str = "smtp.gmail.com"
+    # 587 = STARTTLS submission, 465 = implicit TLS. _send_workout_sync picks
+    # the transport from this value, so either port works unchanged.
+    GMAIL_PORT: int = 587
+    GMAIL_EMAIL: str = os.getenv("GMAIL_EMAIL")         # full gmail address = SMTP username
+    GMAIL_PASSWORD: str = os.getenv("GMAIL_PASSWORD")     # 16-char App Password, NOT the account password
+    GMAIL_FROM: str = os.getenv("GMAIL_FROM")        # blank -> GMAIL_EMAIL
+    GMAIL_TO: str = os.getenv("GMAIL_TO")           # blank -> GMAIL_EMAIL
+    GMAIL_TIMEOUT: int = 15        # seconds for the whole SMTP exchange
+
+    #  applicants table (intake persistence)
+    # The table is created at startup if absent and left alone if present —
+    # see ensure_applicants_table() in app/db/session.py. Set false once the
+    # Alembic revision has been applied in a managed environment, so schema
+    # changes come from migrations only.
+    APPLICANTS_AUTO_CREATE: bool = True
+    # Retention window, stamped onto each row as expires_at at insert time.
+    # scripts/purge_applicants.py deletes rows whose expires_at has passed;
+    # a NULL expires_at is never purged (converted leads).
+    APPLICANT_RETENTION_DAYS: int = 30
+
+    #  mail log file (both mailers)
+    # Mail is fire-and-forget from a background task, so nothing about it ever
+    # reaches an HTTP status code. This file is the only durable answer to
+    # "did it send, and what was in it?" — see app/core/logging.py.
+    MAIL_LOG_ENABLED: bool = True
+    MAIL_LOG_PATH: str = "logs/mail.log"        # relative -> project root
+    # False keeps the audit trail (who/when/outcome) but drops the message text,
+    # for deployments where plan contents must not sit on disk.
+    MAIL_LOG_BODY: bool = True
+    MAIL_LOG_MAX_BYTES: int = 5_000_000         # ~5 MB per file before rotation
+    MAIL_LOG_BACKUP_COUNT: int = 3              # mail.log.1 .. mail.log.3
 
     #  legacy parity switches (Decisions 3 & 4) 
     LEGACY_DEFAULT_CLIENT_ID: int = 1         # PR-01
@@ -92,6 +174,20 @@ class Settings(BaseSettings):
     def _lower_env(cls, v: str) -> str:
         return str(v).lower()
 
+    @field_validator("SMTP_PASSWORD", "GMAIL_PASSWORD", mode="before")
+    @classmethod
+    def _strip_app_password(cls, v: str | None) -> str:
+        """Drop whitespace from a Gmail app password.
+
+        Google presents app passwords as four space-separated groups of four
+        ("abcd efgh ijkl mnop") purely for legibility; the credential is the
+        16 characters. Pasted verbatim it authenticates as a 19-character
+        string and fails with 535, which reads exactly like a wrong password
+        and costs an hour to spot. Stripping here is safe: no SMTP password
+        may contain a space.
+        """
+        return "" if v is None else "".join(str(v).split())
+
     
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -106,13 +202,22 @@ class Settings(BaseSettings):
     @computed_field  # type: ignore[prop-decorator]
     @property
     def DATABASE_URL(self) -> str:
+        """SQLAlchemy DSN for BigRock MySQL.
+
+        aiomysql is PyMySQL's asyncio wrapper — it imports pymysql and reuses
+        its protocol implementation — so this is the PyMySQL driver, reached
+        through the one dialect that keeps AsyncSession working. Every route
+        depends on get_db() yielding an AsyncSession, so a synchronous
+        pymysql.connect() here would break all of them.
+        """
         # quote_plus: a password containing @ / : / # otherwise corrupts the
         # URL — "pw@2026" makes SQLAlchemy read the host as "2026@localhost".
-        user = quote_plus(self.POSTGRES_USER)
-        password = quote_plus(self.POSTGRES_PASSWORD)
+        user = quote_plus(self.DB_USER)
+        password = quote_plus(self.DB_PASSWORD)
         return (
-            f"postgresql+psycopg://{user}:{password}"
-            f"@{self.POSTGRES_HOST}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
+            f"mysql+aiomysql://{user}:{password}"
+            f"@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
+            f"?charset={self.DB_CHARSET}"
         )
 
     @computed_field  # type: ignore[prop-decorator]
@@ -127,4 +232,3 @@ def get_settings() -> Settings:
 
 
 settings = get_settings()
-

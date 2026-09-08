@@ -2,9 +2,10 @@
 from fastapi import APIRouter, BackgroundTasks, Depends
 
 from app.api import openapi_ext
-from app.api.deps import BodyParams
+from app.api.deps import BodyParams, DbSession
 from app.cache.rate_limit import limit_intake
 from app.integrations.mailer import send_intake_email
+from app.repositories import applicant_repo
 from app.services import intake_service
 
 router = APIRouter(tags=["intake"])
@@ -39,13 +40,28 @@ router = APIRouter(tags=["intake"])
         required=["name", "email", "age", "weight"],
     ),
 )
-async def submit_intake(payload: BodyParams, background: BackgroundTasks) -> dict:
-    """PR-33.
+async def submit_intake(
+    payload: BodyParams, db: DbSession, background: BackgroundTasks
+) -> dict:
+    """PR-33. Stores the submission, then notifies by email.
 
-    Validation is synchronous (the user must see field errors); the SMTP send
-    is a background task so the response returns in ~5 ms instead of ~800 ms
-    and does not hold a concurrency slot on a network wait.
+    ORDER MATTERS. Validation runs first, so the user sees field errors on a
+    400 and nothing is written. The row is then saved and committed INSIDE the
+    request; only after that is the mail queued.
+
+    Save-then-queue, not the reverse: a failed insert must abort before any
+    notification exists, otherwise an email can announce a submission that was
+    never stored. The two also differ in how failure is handled — a lost row is
+    permanent data loss and earns a 500 the submitter can retry, while a lost
+    email is recoverable from the row plus logs/mail.log and must never break a
+    submission that already succeeded. That is why the insert is awaited and
+    the SMTP send is not: smtplib blocks for seconds, the INSERT does not.
     """
     subject, body, reply_to = intake_service.build_intake_email(payload)
-    background.add_task(send_intake_email, subject, body, reply_to)
+
+    applicant = await applicant_repo.create(db, intake_service.build_applicant_row(payload))
+
+    background.add_task(
+        send_intake_email, subject, body, reply_to, applicant_id=applicant.id
+    )
     return {"success": True, "message": "Submission received"}
